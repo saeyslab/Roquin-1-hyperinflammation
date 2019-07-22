@@ -1,0 +1,608 @@
+---
+title: "Roquin1 hyperinflammation"
+output: 
+  html_document:
+    toc: yes
+  html_notebook:
+    theme: united
+    toc: yes
+---
+
+This is a computational flow analysis accompanying the paper by Tavernier, 
+Athanasopoulos, Verloo et. al.  
+  
+It contains a FlowSOM analysis of 9 fcs files, as exported from a BD FACSymphony,
+and accompanied by a manual gating analysis of the files in FlowJo.
+
+# Project setup
+
+## Libraries and helper functions
+
+We make use of several libraries for this analysis.  
+  
+If not yet installed, they can be installed using the following code:
+
+```{r}
+# install.packages("BiocManager")
+# BiocManager::install("flowCore")
+# BiocManager::install("flowDensity")
+# BiocManager::install("flowWorkspace")
+# 
+# install.packages("ggplot2")
+# install.packages("RColorBrewer")
+# 
+# install.packages("devtools")
+# devtools::install_github("saeyslab/FlowSOM")
+```
+
+Once installed, they must be loaded:
+
+```{r}
+suppressPackageStartupMessages(library(flowCore))
+suppressPackageStartupMessages(library(flowDensity))
+suppressPackageStartupMessages(library(flowWorkspace))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(FlowSOM))
+```
+
+We also used some helper functions which are not yet included in these libraries:
+
+```{r}
+source("helperFunctions.R")
+```
+
+## FCS file location
+
+All fcs files and corresponding workspaces are assumed to be placed in a folder 
+called "data". We identify the correct fcs files for the sample ids of interest.
+```{r}
+fcs_dir <- "data"
+
+sample_ids <- c("HC249", "HC255", "HC256", "HC257",
+                "HC258", "HC259", "HC262", "PID630")
+controls <- grep("HC", sample_ids, value = TRUE)
+
+fcs_files <- sapply(sample_ids, 
+                    function(x){
+                      grep(paste0(x, ".*fcs"), 
+                           list.files(fcs_dir),
+                           value = TRUE)
+                    })
+fcs_files
+```
+
+## Color definitions
+
+We define specific colors for each sample (blue for HC, red for patient) and
+for each cell type of interest.
+
+```{r}
+sample_colors <- c(RColorBrewer::brewer.pal(9,"Blues")[-c(1,2)], 
+                "#d7301f")
+names(sample_colors) <- sample_ids
+
+celltype_colors <- c("Unknown" = "#FFFFFF",
+                     "Basophils" = "#5854e2",
+                     "cDCs" = "#e2da54",
+                     "pDCs" = "#a90688",
+                     "Monocytes" = "#f37611",
+                     "Tregs" = "#ef82b8",
+                     "Na CD4+ T cells" = "#97b867",
+                     "Eff CD4+ T cells" = "#e2cb5f",
+                     "MAIT cells" = "#632d0f",
+                     "Na CD8+ T cells" = "#7c418f",
+                     "gd T cells" = "#2b5c0d",
+                     "DN T cells" = "#4fb214",
+                     "Eff CD8+ T cells" = "#5c4f3d",
+                     "NK cells" = "#b797c1",
+                     "ILCs" = "#3b7527",
+                     "Memory B cells" = "#ffd800",
+                     "Naive B cells" = "#00abff")
+```
+
+## FlowJo Workspace
+
+Next to some pregating steps to identify single viable cells, the manual gating
+information is not used for the cluster definition of the data. However, we 
+provide the manual labels for easier interpretation of the FlowSOM tree. In the 
+original workspace the gates were named quite detailed, which is reduced here to
+a smaller set of gate names for readibility.
+
+```{r}
+gates_of_interest <- c("Naive B cells" = "Naive B cells", 
+                       "Transitional B cells" = "Naive B cells",
+                       "Non Switched B cells" = "Memory B cells", 
+                       "Switched Memory B cells" = "Memory B cells",
+                       "CD16hi NK cells" = "NK cells", 
+                       "CD56 dim NK cells" = "NK cells", 
+                       "CD56hi NK cells" = "NK cells",
+                       "CD14+ CD16+ Monocytes" = "Monocytes",
+                       "CD14+ Monocytes" = "Monocytes", 
+                       "CD16+ Monocytes" = "Monocytes",
+                       "Basophils" = "Basophils", 
+                       "ILCs/ILCs" = "ILCs",
+                       "DC1" = "cDCs",
+                       "DC2" = "cDCs", 
+                       "Plasmacytoid DCs" = "pDCs", 
+                       "CD4+ CD8+ T cells" = "Eff CD8+ T cells",
+                       "CM CD4+ T cells" = "Eff CD4+ T cells", 
+                       "EM CD4+ T cells" = "Eff CD4+ T cells",
+                       "Naive CD4+ T cells" = "Na CD4+ T cells",
+                       "T regs" = "Tregs",
+                       "CM CD8+ T cells" = "Eff CD8+ T cells-",
+                       "EM CD8+ T cells" = "Eff CD8+ T cells",
+                       "Naive CD8+ T cells" = "Na CD8+ T cells",
+                       "DN T cells" = "DN T cells",
+                       "TCRgd+ T cells" = "gd T cells",
+                       "Va24Ja18+ T cells/EM DN T cells" = "DN T cells",
+                       "Va24Ja18+ T cells/Naive DN T cells" = "DN T cells",
+                       "Va7-2+ T cells" = "Unknown",
+                       "MAIT cells" = "MAIT cells")
+```
+
+# Preprocessing
+
+We create a directory to save the preprocessed files
+
+```{r}
+if(!dir.exists("preprocessed")){
+  dir.create("preprocessed")
+}
+```
+
+For every sample, we identify which cells fall in the viable single cell
+gate as manually gated in FlowJo 10 and extract the compensation and 
+transformation as set up in the FlowJo workspaces. We did observe some cells 
+with unrealistic high or low values when measured on the FACSymphony. 
+Therefore, we also remove all cells in which any of the values fall out of the 
+expected range. This final selection with compensated and transformed values 
+are saved to new fcs files.  Additionally, the corresponding manual labels are 
+also saved.
+
+```{r}
+for (sample in sample_ids) {
+  print(paste0("Preprocessing ", sample))
+  
+  file <- fcs_files[sample]
+  
+  # Read in the FlowJo workspace for correct compensation, transformation,
+  # pregating and further gating information
+  wsp_file <- file.path(fcs_dir,
+                        paste0("manual_pregating_", sample, ".wsp"))
+  flowjo_res <- parse_flowjo(file, wsp_file)
+  in_start_gate <- flowjo_res$gates[,"Viable cells"]
+  
+  # Extra step to remove symphony outliers, based on raw files
+  ff <- read.FCS(file.path(fcs_dir, file),
+                 truncate_max_range = FALSE)
+  in_range <- (rowSums(ff@exprs >= 262140) == 0) &
+    (rowSums(ff@exprs <= -111) == 0) &
+    (rowSums(flowjo_res$flowFrame@exprs <= -100) == 0)
+  
+  # Combine the two selection criteria
+  selection <- in_start_gate & in_range
+  
+  # Write selection to new file
+  write.FCS(flowjo_res$flowFrame[selection],
+            paste0("preprocessed/", file))
+  
+  # Extract manual labels for easier interpretation of results
+  manual <- list(matrix = flowjo_res$gates[selection, ],
+                 manual = manual_vector(flowjo_res$gates, 
+                                        names(gates_of_interest))[selection])
+  saveRDS(manual,
+          paste0("preprocessed/",gsub(".fcs", "_manual.RDS", file)))
+  
+  # Save which cells were selected, to allow mapping back to the original
+  # fcs files
+  saveRDS(selection,
+          paste0("preprocessed/",gsub(".fcs", "_selection.RDS", file)))
+}
+```
+
+We create an aggregate file containing a random subsample of 300 000 cells from
+each of the files. This subset will be used to train the FlowSOM algorithm.
+
+```{r}
+set.seed(1)
+ff <- AggregateFlowFrames(paste0("preprocessed/", fcs_files),
+                          cTotal = 300000 * length(fcs_files),
+                          writeOutput = TRUE,
+                          outputFile = "preprocessed/aggregate.fcs",
+                          writeMeta = TRUE)
+table(ff@exprs[,"File"])
+```
+
+# FlowSOM analysis
+
+## Learn the tree
+
+We train a 15 x 15 FlowSOM grid on the aggregated file using 25 channels.
+To ensure optimal training for this gridsize and number of dimensions, we 
+increased the number of iterations over the dataset to 20. On the resulting 
+tree, 50 metaclusters are identified. We do not rescale the data (using the
+numeric values as defined by the FlowJo transformation).
+
+```{r}
+ff <- read.FCS("preprocessed/aggregate.fcs")
+
+markers_to_use <- c("CD3", "CD4", "CD8", "CD11b", "CD11c", "CD14", "CD16",
+                    "CD20", "CD24_TCRgd", "CD25", "CD27", "CD38", "CD45RA",
+                    "CD56", "CD123", "CD127", "CD183", "CD185", "CD194", 
+                    "CD196", "CD197", "CD294|XCR1", "PD1", "IgD_Va7-2", 
+                    "HLA-DR")
+
+channels_to_use <- suppressWarnings(get_channels(ff, 
+                                                 paste0(markers_to_use,"#")))
+
+fsom <- FlowSOM(ff,
+                scale = FALSE,
+                xdim = 15,
+                ydim = 15,
+                colsToUse = channels_to_use,
+                rlen = 20,
+                nClus = 50,
+                seed = 1)
+fsom$FlowSOM$prettyColnames <- gsub(" \\(.*", "", fsom$FlowSOM$prettyColnames)
+saveRDS(fsom, "FSOM.RDS")
+```
+
+```{r}
+fsom <- readRDS("FSOM.RDS")
+```
+
+## Labeling the tree nodes
+
+For easier interpretation of the tree, we determine the most represented manual
+label for each of the metaclusters.
+
+```{r}
+# Get the manual labels for the subset of cells used to train the FlowSOM grid
+manual_subset <- c()
+for (file in fcs_files) {
+  manual <- readRDS(file.path("preprocessed", 
+                              gsub(".fcs", "_manual.RDS", 
+                                   file)))
+  selection <- read.table(file.path("preprocessed",
+                                    gsub(".fcs", "_selected_aggregate.txt", 
+                                         file)))
+  labels <- as.character(manual$manual[selection$x])
+  
+  manual_subset <- c(manual_subset,
+                     gates_of_interest[labels])
+}
+manual_subset[is.na(manual_subset)] <- "Unknown"
+manual_subset <- factor(manual_subset,
+                        levels = names(celltype_colors))
+
+# Determine the most occuring label per cluster
+c_label <- label_clusters(fsom, 
+                          manual_subset)
+```
+
+## Map the original data to the tree
+
+Once the tree is learned, we map the full preprocessed fcs file to the tree.
+This allows us to have a cluster assigned to all cells from these files, rather
+than just the subset selected for the aggregate file.  
+
+We create a directory to save the results.
+
+```{r}  
+if (!dir.exists("clustered")){
+  dir.create("clustered") 
+}
+```
+
+We compute the percentage of cells assigned to each of the clusters for each of 
+the files. Additionally, new fcs files are generated in which two dimensions are
+added, containing the cluster and metacluster numbers for each cell. This allows
+further inspection of the clusters in other tools (e.g. FlowJo).
+
+```{r}
+clusterCounts <- matrix(0,
+                        nrow = length(fcs_files),
+                        ncol = fsom$FlowSOM$map$nNodes,
+                        dimnames = list(
+                          sample_ids,
+                          as.character(seq_len(fsom$FlowSOM$map$nNodes))))
+for (sample in sample_ids){
+  file <- fcs_files[sample]
+  
+  # Map the full file to the FlowSOM model
+  fsom_tmp <- NewData(fsom$FlowSOM, file.path("preprocessed", file))
+  
+  # Count the number of cells assigned to each cluster
+  table_tmp <- table(GetClusters(fsom_tmp))
+  clusterCounts[sample, names(table_tmp)] <- table_tmp 
+  
+  # Generate new fcs files in which the cluster numbers are added
+  ff <- read.FCS(file.path(fcs_dir, file),
+                 truncate_max_range = FALSE)
+  selection <- readRDS(file.path("preprocessed",
+                                 gsub(".fcs", "_selection.RDS", file)))
+  clusters <- rep(0, nrow(ff))
+  clusters[selection] <- GetClusters(fsom_tmp)
+  metaclusters <- rep(0, nrow(ff))
+  metaclusters[selection] <- GetMetaclusters(fsom_tmp, fsom$metaclustering)
+  
+  ff <- cbind2(ff, cbind(FlowSOM_clusters = clusters, 
+                         FlowSOM_metaclusters = metaclusters))
+  write.FCS(ff,
+            file.path("clustered", file))
+}
+
+# Convert counts to percentages
+clusterPctgs <- t(apply(clusterCounts, 1, function(x){x/sum(x)}))
+
+# Save the result
+saveRDS(clusterCounts, "FlowSOM_counts.RDS")
+saveRDS(clusterPctgs, "FlowSOM_percentages.RDS")
+```
+
+```{r}
+clusterCounts <- readRDS("FlowSOM_counts.RDS")
+clusterPctgs <- readRDS("FlowSOM_percentages.RDS")
+```
+
+## Comparison of the patient to the healthy controls
+
+Once all cluster percentages are determined, we compute the z-score for the
+patient: the patient percentage minus the mean of the healthy controls, divided 
+by the standard deviation of the healthy controls. We then also rank the 
+clusters based on their z-score.
+
+```{r}
+z_scores <- apply(clusterPctgs,
+              2,
+              function(x){
+                (x["PID630"] - mean(x[controls])) / sd(x[controls])
+              })
+
+cluster_ranking <- order(abs(z_scores), decreasing = TRUE)
+  
+saveRDS(z_scores, "FlowSOM_z_scores.RDS")
+saveRDS(cluster_ranking, "FlowSOM_cluster_ranking.RDS")
+```
+
+# Resulting figures
+
+Using all of the previously computed results, we generated the figures for
+the paper.
+
+```{r}
+ff <- read.FCS("preprocessed/aggregate.fcs")
+fsom <- readRDS("FSOM.RDS")
+clusterCounts <- readRDS("FlowSOM_counts.RDS")
+clusterPctgs <- readRDS("FlowSOM_percentages.RDS")
+z_scores <- readRDS("FlowSOM_z_scores.RDS")
+cluster_ranking <- readRDS("FlowSOM_cluster_ranking.RDS")
+```
+
+## Overview of the cluster labels
+
+```{r fig.width=10}
+pdf("FlowSOM_pies_overview.pdf", width = 8, height = 11)
+PlotPies(UpdateNodeSize(fsom$FlowSOM, 
+                        reset = TRUE, maxNodeSize = 4),
+         manual_subset,
+         colorPalette = colorRampPalette(celltype_colors))
+dev.off()
+```
+
+```{r fig.width=10}
+PlotDiscreteVariable(UpdateNodeSize(fsom$FlowSOM, 
+                                    reset = TRUE, maxNodeSize = 5),
+                     variable = factor(c_label, 
+                                       levels = names(celltype_colors)),
+                     colors = celltype_colors)
+```
+
+## Overview figure of the z-scores
+
+```{r}
+z_score_cutoff <- 2
+diff_clusters <- which(abs(z_scores) > z_score_cutoff)
+```
+
+```{r fig.width = 12, fig.height = 4}
+#ord <- order(z_scores)
+#ord <- seq_along(z_scores)
+ord <- order(factor(c_label, levels = names(celltype_colors)))
+
+par(mar=c(2,4,1,1))
+plot(x = 1:225, 
+     y = z_scores[ord],
+     col = paste0(c("#225ea8","#ef6548")[(1 + (z_scores > 0))[ord]],
+                  c("33", "FF")[1+(abs(z_scores) > z_score_cutoff)[ord]]),
+     pch = 19,
+     ylim = c(-5, 35),
+     xlab = "", xaxt = "n",
+     ylab = "Z-score")
+abline(h = z_score_cutoff, lty = 3)
+abline(h = -z_score_cutoff, lty = 3)
+
+text(sapply(diff_clusters, function(x) which(ord == x)),
+     z_scores[diff_clusters],
+     diff_clusters,
+     col = gsub("#FFFFFF", "#000000", celltype_colors[c_label[diff_clusters]]),
+     pos = c(1,3)[(1 + (z_scores > 0))][diff_clusters],
+     cex = 1)
+```
+
+## Overview of the most different clusters
+
+```{r fig.width = 10, fig.height = 10}
+node_colors <- c("--" = "white", 
+                 "Underexpressed" = "#225ea8", 
+                 "Overexpressed" = "#ef6548")
+node_text_colors <- c("--" = "black", 
+                      "Underexpressed" = "white", 
+                      "Overexpressed" = "white")
+node_types <- factor(c("--", "Underexpressed", "Overexpressed")[1 + 
+                                                                  (abs(z_scores) > z_score_cutoff) + 
+                                                                  (z_scores > z_score_cutoff)])
+graph <- fsom$FlowSOM$MST$graph
+igraph::V(graph)$size <- 5
+igraph::V(graph)$color <- node_colors[as.character(node_types)]
+igraph::V(graph)$label <- seq_len(fsom$FlowSOM$map$nNodes)
+igraph::V(graph)$label.color <- node_text_colors[as.character(node_types)]
+igraph::V(graph)$label.cex <- 0.5
+igraph::plot.igraph(graph, 
+                    layout = fsom$FlowSOM$MST$l,
+                    edge.lty = 1,
+                    mark.groups = as.list(1:225), 
+                    mark.col = celltype_colors[c_label], 
+                    mark.border = celltype_colors[c_label],
+                    mark.expand = 3)
+
+```
+
+## Patient distribution
+
+```{r fig.width = 10}
+PlotPies(UpdateNodeSize(fsom$FlowSOM, reset = TRUE, maxNodeSize = 5),
+         sample_ids[fsom$FlowSOM$data[,"File"]],
+         colorPalette = colorRampPalette(sample_colors),
+         backgroundValues = factor(c_label, 
+                                       levels = names(celltype_colors)),
+         backgroundColor = paste0(celltype_colors, "33"))
+```
+
+## Closer inspection of two clusters
+
+```{r fig.width = 8, fig.height=8}
+layout(matrix(1:4, ncol = 2))
+PlotClusters2D(fsom$FlowSOM,
+               "FSC-A", "FSC-H",
+               51)
+PlotClusters2D(fsom$FlowSOM,
+               suppressWarnings(get_channels(ff, "CD20#")), 
+               suppressWarnings(get_channels(ff, "CD14#")),
+               51)
+
+PlotClusters2D(fsom$FlowSOM,
+               "FSC-A", "FSC-H",
+               66)
+PlotClusters2D(fsom$FlowSOM,
+               suppressWarnings(get_channels(ff, "CD3#")), 
+               suppressWarnings(get_channels(ff, "CD14#")),
+               66)
+```
+
+
+## Overview list of the z scores
+
+```{r}
+sort(z_scores[z_scores > z_score_cutoff], decreasing = TRUE)
+sort(z_scores[z_scores < -z_score_cutoff])
+```
+
+## Box plots of the differential clusters
+
+```{r fig.width = 6, fig.height = 10}
+to_plot <- data.frame()
+
+for(cluster in 1:225){
+  to_plot <- rbind(to_plot,
+                   data.frame(cluster,
+                              sample = rownames(clusterPctgs), #c(rep("Ctrl", 7),"R688*/R688*"),
+                              value = clusterPctgs[,cluster]))
+}
+to_plot$cluster <- factor(to_plot$cluster,
+                          levels = ord)
+to_plot$cluster_names <- paste0(to_plot$cluster, 
+                                " (", c_label[as.character(to_plot$cluster)],")")
+to_plot$cluster_names <- factor(to_plot$cluster_names,
+                                levels = paste0(ord,
+                                                " (", c_label[ord],")"))
+
+to_plot_extra <- data.frame(t(rbind(cluster = 1:225, 
+                                    sapply(1:225, function(cluster){
+                                      d <- to_plot$value[to_plot$cluster == cluster &
+                                                           to_plot$sample %in% controls]
+                                      c(mean = mean(d), sd = sd(d))}),
+                                    z_score = z_scores)))
+
+to_plot_extra$cluster <- factor(to_plot_extra$cluster,
+                                levels = ord)
+
+to_plot_extra$cluster_names <- paste0(to_plot_extra$cluster, 
+                                      " (", c_label[as.character(to_plot_extra$cluster)],")")
+to_plot_extra$cluster_names <- factor(to_plot_extra$cluster_names,
+                                      levels = paste0(ord,
+                                                      " (", c_label[ord],")"))
+
+p <- ggplot(to_plot[to_plot$cluster %in% diff_clusters, ]) +
+  geom_point(aes(x = cluster_names, y = value, col = sample)) +
+  scale_color_manual(values = sample_colors) +
+  geom_crossbar(aes(x = cluster_names, y = mean, ymin = mean - sd, ymax = mean + sd),
+                width = 0.5, col = "grey", 
+                data = to_plot_extra[to_plot_extra$cluster %in% diff_clusters, ]) +
+  geom_text(aes(x = cluster_names, label = round(z_score, 2)), y = 0.03, #angle = 90,
+            data = to_plot_extra[to_plot_extra$cluster %in% diff_clusters, ]) +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.y = element_text(colour = gsub("#FFFFFF", "#000000", celltype_colors[c_label[names(sort(sapply(diff_clusters, function(x){which(x == ord)})))]]))) +
+  ylab("% of viable PBMCs") +
+  xlab("") +
+  ylim(c(0, 0.035))
+
+ggsave("Boxplots_significant_clusters.pdf",
+       width = 8.3, height = 11.7,
+       plot = p)
+
+print(p)
+```
+
+```{r}
+output <- clusterPctgs
+colnames(output) <- paste0(colnames(output), 
+                           " (", c_label[colnames(output)], ")")
+openxlsx::write.xlsx(t(output[, diff_clusters]),
+                     col.names = TRUE,
+                     row.names = TRUE,
+                     "diff_cluster_percentages.xlsx")
+```
+
+# Regarding questions of the reviewers
+
+## CD4+ naive T cell subset not found in manual gating
+
+```{r, fig.width = 15}
+marker_heatmap <- fsom$FlowSOM$map$medianValues[, channels_to_use]
+rownames(marker_heatmap) <- as.character(seq_len(nrow(marker_heatmap)))
+colnames(marker_heatmap) <- get_markers(ff, colnames(marker_heatmap))
+pheatmap::pheatmap(marker_heatmap[grep("Na CD4\\+ T cells", c_label), ], 
+                   scale = "column")
+```
+
+```{r fig.width = 16, fig.height=20}
+clusters_to_plot <- c(154, 153, 183, 155,79)
+layout(matrix(seq_len(4 * length(clusters_to_plot)), 
+              nrow = length(clusters_to_plot),
+              byrow = TRUE))
+for(cl in clusters_to_plot){
+  PlotClusters2D(fsom$FlowSOM,
+                 suppressWarnings(get_channels(ff, "CD3#")), 
+                 suppressWarnings(get_channels(ff, "CD4#")),
+                 cl,
+                 main = cl)
+  PlotClusters2D(fsom$FlowSOM,
+                 suppressWarnings(get_channels(ff, "CD197#")), 
+                 suppressWarnings(get_channels(ff, "CD45RA#")),
+                 cl,
+                 main = cl)
+  PlotClusters2D(fsom$FlowSOM,
+                 suppressWarnings(get_channels(ff, "CD27#")), 
+                 suppressWarnings(get_channels(ff, "CD38#")),
+                 cl,
+                 main = cl)
+
+  PlotClusters2D(fsom$FlowSOM,
+                 suppressWarnings(get_channels(ff, "PD1#")), 
+                 suppressWarnings(get_channels(ff, "CD127#")),
+                 cl,
+                 main = cl)
+}
+```
